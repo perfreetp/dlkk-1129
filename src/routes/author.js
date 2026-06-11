@@ -88,7 +88,7 @@ router.get(
     ).all(req.params.id);
 
     const posts = db.prepare(
-      `SELECT id, title, created_at, like_count, reply_count, 'post' AS type FROM discussion_posts WHERE user_id = ?`
+      `SELECT id, title, created_at, like_count, reply_count, 'post' AS type FROM discussion_posts WHERE user_id = ? AND is_hidden = 0`
     ).all(req.params.id);
 
     const allItems = [...software, ...collections, ...posts];
@@ -130,7 +130,7 @@ router.get(
     ).get(req.params.id).count;
 
     const postCount = db.prepare(
-      `SELECT COUNT(*) AS count FROM discussion_posts WHERE user_id = ?`
+      `SELECT COUNT(*) AS count FROM discussion_posts WHERE user_id = ? AND is_hidden = 0`
     ).get(req.params.id).count;
 
     const followerCount = db.prepare(
@@ -164,13 +164,13 @@ router.get(
     }
 
     const total = db.prepare(
-      `SELECT COUNT(*) AS total FROM discussion_posts WHERE user_id = ?`
+      `SELECT COUNT(*) AS total FROM discussion_posts WHERE user_id = ? AND is_hidden = 0`
     ).get(req.params.id).total;
 
     const items = db.prepare(
       `SELECT p.*, p.like_count, p.reply_count
        FROM discussion_posts p
-       WHERE p.user_id = ?
+       WHERE p.user_id = ? AND p.is_hidden = 0
        ORDER BY p.created_at DESC
        LIMIT ? OFFSET ?`
     ).all(req.params.id, limit, offset);

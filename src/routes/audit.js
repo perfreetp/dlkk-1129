@@ -36,49 +36,6 @@ function ensureSchemaColumns(db) {
 }
 
 function ensureAuditLogActions(db) {
-  const result = db.prepare(`
-    SELECT sql FROM sqlite_master 
-    WHERE type = 'table' AND name = 'audit_logs'
-  `).get();
-  
-  if (result && result.sql) {
-    const hasResolve = result.sql.includes("'resolve'");
-    const hasDismiss = result.sql.includes("'dismiss'");
-    
-    if (!hasResolve || !hasDismiss) {
-      try {
-        db.exec("PRAGMA writable_schema = 1");
-        const updateStmt = db.prepare(`
-          UPDATE sqlite_master 
-          SET sql = REPLACE(sql, 
-            "CHECK(action IN ('approve','reject','delist','risk','merge'))",
-            "CHECK(action IN ('approve','reject','delist','risk','merge','resolve','dismiss'))"
-          ) 
-          WHERE type = 'table' AND name = 'audit_logs'
-        `);
-        const updateResult = updateStmt.run();
-        db.exec("PRAGMA writable_schema = 0");
-        
-        if (updateResult.changes === 0) {
-          const oldPattern = /CHECK\(action IN \([^)]+\)\)/;
-          const match = result.sql.match(oldPattern);
-          if (match) {
-            const oldConstraint = match[0];
-            const newConstraint = oldConstraint.replace("')", ",'resolve','dismiss')");
-            db.exec("PRAGMA writable_schema = 1");
-            db.prepare(`
-              UPDATE sqlite_master 
-              SET sql = REPLACE(sql, ?, ?)
-              WHERE type = 'table' AND name = 'audit_logs'
-            `).run(oldConstraint, newConstraint);
-            db.exec("PRAGMA writable_schema = 0");
-          }
-        }
-      } catch (e) {
-        console.warn('Could not update audit_logs constraint, continuing anyway:', e.message);
-      }
-    }
-  }
 }
 
 function insertNotification(db, user_id, type, title, content, related_id) {
@@ -90,12 +47,12 @@ function insertNotification(db, user_id, type, title, content, related_id) {
 function getTargetInfo(db, targetType, targetId) {
   if (targetType === 'post') {
     return db.prepare(`
-      SELECT id, title, LEFT(content, 100) AS content_preview, user_id, is_hidden
+      SELECT id, title, SUBSTR(content, 1, 100) AS content_preview, user_id, is_hidden
       FROM discussion_posts WHERE id = ?
     `).get(targetId);
   } else if (targetType === 'reply') {
     return db.prepare(`
-      SELECT r.id, LEFT(r.content, 100) AS content_preview, r.user_id, r.post_id, r.is_hidden,
+      SELECT r.id, SUBSTR(r.content, 1, 100) AS content_preview, r.user_id, r.post_id, r.is_hidden,
              p.title AS post_title
       FROM discussion_replies r
       JOIN discussion_posts p ON p.id = r.post_id
@@ -222,17 +179,44 @@ router.put('/reports/:id/resolve', auth, requireRole('admin'), asyncHandler(asyn
     }
 
     db.prepare(`
-      INSERT INTO audit_logs (submission_id, software_id, auditor_id, action, note)
-      VALUES (?, ?, ?, 'resolve', ?)
+      INSERT INTO audit_logs (submission_id, software_id, auditor_id, action, note, software_name, submission_name, original_software_id, original_submission_id)
+      VALUES (?, ?, ?, 'resolve', ?, ?, ?, ?, ?)
     `).run(
       report.target_type === 'submission' ? report.target_id : null,
       report.target_type === 'software' ? report.target_id : null,
       req.user.id,
-      resolution_note || `Resolved report #${reportId} (${report.target_type} #${report.target_id})`
+      resolution_note || `Resolved report #${reportId} (${report.target_type} #${report.target_id})`,
+      report.target_type === 'software' ? (db.prepare('SELECT name FROM software WHERE id = ?').get(report.target_id)?.name || '') : '',
+      report.target_type === 'submission' ? (db.prepare('SELECT name FROM submissions WHERE id = ?').get(report.target_id)?.name || '') : '',
+      report.target_type === 'software' ? report.target_id : null,
+      report.target_type === 'submission' ? report.target_id : null
     );
   });
 
   transaction();
+
+  insertNotification(
+    db,
+    report.reporter_id,
+    'report_resolved',
+    '举报处理结果',
+    `您举报的${report.target_type}已处理: ${resolution_note || '内容已隐藏'}`,
+    report.id
+  );
+
+  if (report.target_type === 'post' || report.target_type === 'reply') {
+    const targetInfo = getTargetInfo(db, report.target_type, report.target_id);
+    if (targetInfo && targetInfo.user_id) {
+      insertNotification(
+        db,
+        targetInfo.user_id,
+        'content_hidden',
+        '内容已被处理',
+        `您的${report.target_type}因举报已被处理: ${resolution_note || '内容已隐藏'}`,
+        report.id
+      );
+    }
+  }
 
   res.json({ message: 'Report resolved successfully' });
 }));
@@ -257,17 +241,44 @@ router.put('/reports/:id/dismiss', auth, requireRole('admin'), asyncHandler(asyn
     `).run(resolution_note || '', reportId);
 
     db.prepare(`
-      INSERT INTO audit_logs (submission_id, software_id, auditor_id, action, note)
-      VALUES (?, ?, ?, 'dismiss', ?)
+      INSERT INTO audit_logs (submission_id, software_id, auditor_id, action, note, software_name, submission_name, original_software_id, original_submission_id)
+      VALUES (?, ?, ?, 'dismiss', ?, ?, ?, ?, ?)
     `).run(
       report.target_type === 'submission' ? report.target_id : null,
       report.target_type === 'software' ? report.target_id : null,
       req.user.id,
-      resolution_note || `Dismissed report #${reportId} (${report.target_type} #${report.target_id})`
+      resolution_note || `Dismissed report #${reportId} (${report.target_type} #${report.target_id})`,
+      report.target_type === 'software' ? (db.prepare('SELECT name FROM software WHERE id = ?').get(report.target_id)?.name || '') : '',
+      report.target_type === 'submission' ? (db.prepare('SELECT name FROM submissions WHERE id = ?').get(report.target_id)?.name || '') : '',
+      report.target_type === 'software' ? report.target_id : null,
+      report.target_type === 'submission' ? report.target_id : null
     );
   });
 
   transaction();
+
+  insertNotification(
+    db,
+    report.reporter_id,
+    'report_dismissed',
+    '举报已驳回',
+    `您举报的${report.target_type}经审核未违规`,
+    report.id
+  );
+
+  if (report.target_type === 'post' || report.target_type === 'reply') {
+    const targetInfo = getTargetInfo(db, report.target_type, report.target_id);
+    if (targetInfo && targetInfo.user_id) {
+      insertNotification(
+        db,
+        targetInfo.user_id,
+        'report_cleared',
+        '举报已驳回',
+        '您的内容经审核未违规，已恢复显示',
+        report.id
+      );
+    }
+  }
 
   res.json({ message: 'Report dismissed successfully' });
 }));
@@ -310,6 +321,97 @@ router.get('/reports/stats', auth, requireRole('admin'), asyncHandler(async (req
   res.json(stats);
 }));
 
+router.get('/dashboard', auth, requireRole('editor', 'admin'), asyncHandler(async (req, res) => {
+  const db = getDb();
+  const days = Math.max(1, parseInt(req.query.days, 10) || 30);
+  const { action } = req.query;
+
+  const validActions = ['approve', 'reject', 'delist', 'risk', 'merge', 'resolve', 'dismiss', 'delete'];
+  const actionFilter = action && validActions.includes(action) ? action : null;
+
+  const trendCondition = actionFilter ? "AND action = ?" : "";
+  const trendParams = actionFilter ? [actionFilter] : [];
+
+  const event_trends = db.prepare(`
+    SELECT DATE(created_at) AS date, action, COUNT(*) AS count
+    FROM audit_logs
+    WHERE DATE(created_at) >= DATE('now', '-' || ? || ' days')
+    ${trendCondition}
+    GROUP BY DATE(created_at), action
+    ORDER BY date DESC, action
+  `).all(days, ...trendParams);
+
+  const summaryRows = db.prepare(`
+    SELECT action, COUNT(*) AS count
+    FROM audit_logs
+    WHERE DATE(created_at) >= DATE('now', '-' || ? || ' days')
+    GROUP BY action
+  `).all(days);
+
+  const action_summary = { approve: 0, reject: 0, delist: 0, risk: 0, merge: 0, resolve: 0, dismiss: 0, delete: 0 };
+  for (const row of summaryRows) {
+    if (action_summary.hasOwnProperty(row.action)) {
+      action_summary[row.action] = row.count;
+    }
+  }
+
+  const recent_events = db.prepare(`
+    SELECT al.*, u.username AS auditor_username,
+           COALESCE(s.name, al.software_name, '(已删除)') AS software_name,
+           COALESCE(sub.name, al.submission_name, '') AS submission_name
+    FROM audit_logs al
+    LEFT JOIN users u ON u.id = al.auditor_id
+    LEFT JOIN software s ON s.id = al.software_id
+    LEFT JOIN submissions sub ON sub.id = al.submission_id
+    ORDER BY al.created_at DESC
+    LIMIT 20
+  `).all();
+
+  res.json({ event_trends, action_summary, recent_events });
+}));
+
+router.get('/dashboard/software/:id', auth, requireRole('editor', 'admin'), asyncHandler(async (req, res) => {
+  const db = getDb();
+
+  const software = db.prepare('SELECT * FROM software WHERE id = ?').get(req.params.id);
+
+  const audit_logs = db.prepare(`
+    SELECT al.*, u.username AS auditor_username
+    FROM audit_logs al
+    LEFT JOIN users u ON u.id = al.auditor_id
+    WHERE al.software_id = ? OR al.original_software_id = ?
+    ORDER BY al.created_at DESC
+  `).all(req.params.id, req.params.id);
+
+  const softwareName = software ? software.name : (audit_logs.find(l => l.software_name)?.software_name) || '(已删除)';
+  res.json({ software: software || { id: parseInt(req.params.id), name: softwareName }, audit_logs });
+}));
+
+router.get('/dashboard/user/:id', auth, requireRole('editor', 'admin'), asyncHandler(async (req, res) => {
+  const db = getDb();
+
+  const user = db.prepare('SELECT id, username, email, role, created_at FROM users WHERE id = ?').get(req.params.id);
+  if (!user) throw createError(404, 'User not found');
+
+  const audit_logs = db.prepare(`
+    SELECT al.*, COALESCE(s.name, al.software_name, '(已删除)') AS software_name, COALESCE(sub.name, al.submission_name, '') AS submission_name
+    FROM audit_logs al
+    LEFT JOIN software s ON s.id = al.software_id
+    LEFT JOIN submissions sub ON sub.id = al.submission_id
+    WHERE al.auditor_id = ?
+    ORDER BY al.created_at DESC
+  `).all(req.params.id);
+
+  const submissions = db.prepare(`
+    SELECT id, name, status, created_at, updated_at
+    FROM submissions
+    WHERE user_id = ?
+    ORDER BY created_at DESC
+  `).all(req.params.id);
+
+  res.json({ user, audit_logs, submissions });
+}));
+
 router.post('/:id/approve', auth, requireRole('editor', 'admin'), asyncHandler(async (req, res) => {
   const db = getDb();
   const submission = db.prepare('SELECT * FROM submissions WHERE id = ?').get(req.params.id);
@@ -324,8 +426,8 @@ router.post('/:id/approve', auth, requireRole('editor', 'admin'), asyncHandler(a
     UPDATE submissions SET status = 'approved', updated_at = datetime('now'), merged_to = ? WHERE id = ?
   `);
   const insertAuditLog = db.prepare(`
-    INSERT INTO audit_logs (submission_id, software_id, auditor_id, action, note)
-    VALUES (?, ?, ?, 'approve', '')
+    INSERT INTO audit_logs (submission_id, software_id, auditor_id, action, note, software_name, submission_name, original_software_id, original_submission_id)
+    VALUES (?, ?, ?, 'approve', '', ?, ?, ?, ?)
   `);
   const insertVersion = db.prepare(`
     INSERT INTO versions (software_id, version_number, release_notes, compatibility)
@@ -374,7 +476,7 @@ router.post('/:id/approve', auth, requireRole('editor', 'admin'), asyncHandler(a
     });
 
     updateSubmission.run(softwareId, req.params.id);
-    insertAuditLog.run(req.params.id, softwareId, req.user.id);
+    insertAuditLog.run(req.params.id, softwareId, req.user.id, submission.name, submission.name, softwareId, req.params.id);
 
     insertNotification(
       db,
@@ -404,14 +506,13 @@ router.post('/:id/reject', auth, requireRole('editor', 'admin'), asyncHandler(as
     UPDATE submissions SET status = 'rejected', audit_note = ?, updated_at = datetime('now') WHERE id = ?
   `);
   const insertAuditLog = db.prepare(`
-    INSERT INTO audit_logs (submission_id, auditor_id, action, note)
-    VALUES (?, ?, 'reject', ?)
+    INSERT INTO audit_logs (submission_id, auditor_id, action, note, software_name, submission_name, original_submission_id)
+    VALUES (?, ?, 'reject', ?, '', ?, ?)
   `);
 
   const transaction = db.transaction(() => {
     updateSubmission.run(note || '', req.params.id);
-    insertAuditLog.run(req.params.id, req.user.id, note || '');
-
+    insertAuditLog.run(req.params.id, req.user.id, note || '', submission.name, req.params.id);
     insertNotification(
       db,
       submission.user_id,
@@ -436,13 +537,13 @@ router.put('/software/:id/delist', auth, requireRole('admin'), asyncHandler(asyn
     UPDATE software SET status = 'delisted', updated_at = datetime('now') WHERE id = ?
   `);
   const insertAuditLog = db.prepare(`
-    INSERT INTO audit_logs (software_id, auditor_id, action, note)
-    VALUES (?, ?, 'delist', ?)
+    INSERT INTO audit_logs (software_id, auditor_id, action, note, software_name, original_software_id)
+    VALUES (?, ?, 'delist', ?, ?, ?)
   `);
 
   const transaction = db.transaction(() => {
     updateSoftware.run(req.params.id);
-    insertAuditLog.run(req.params.id, req.user.id, note || '');
+    insertAuditLog.run(req.params.id, req.user.id, note || '', software.name, req.params.id);
 
     if (software.developer_id) {
       insertNotification(
@@ -471,13 +572,13 @@ router.put('/software/:id/risk', auth, requireRole('admin'), asyncHandler(async 
     UPDATE software SET status = 'risky', risk_note = ?, updated_at = datetime('now') WHERE id = ?
   `);
   const insertAuditLog = db.prepare(`
-    INSERT INTO audit_logs (software_id, auditor_id, action, note)
-    VALUES (?, ?, 'risk', ?)
+    INSERT INTO audit_logs (software_id, auditor_id, action, note, software_name, original_software_id)
+    VALUES (?, ?, 'risk', ?, ?, ?)
   `);
 
   const transaction = db.transaction(() => {
     updateSoftware.run(risk_note, req.params.id);
-    insertAuditLog.run(req.params.id, req.user.id, risk_note);
+    insertAuditLog.run(req.params.id, req.user.id, risk_note, software.name, req.params.id);
 
     if (software.developer_id) {
       insertNotification(
@@ -539,9 +640,9 @@ router.post('/merge', auth, requireRole('admin'), asyncHandler(async (req, res) 
 
     db.prepare('DELETE FROM software WHERE id = ?').run(source_id);
     db.prepare(`
-      INSERT INTO audit_logs (software_id, auditor_id, action, note)
-      VALUES (?, ?, 'merge', ?)
-    `).run(target_id, req.user.id, `Merged software ${source_id} into ${target_id}`);
+      INSERT INTO audit_logs (software_id, auditor_id, action, note, software_name, original_software_id)
+      VALUES (?, ?, 'merge', ?, ?, ?)
+    `).run(target_id, req.user.id, `Merged software ${source_id} into ${target_id}`, targetSoftware.name, target_id);
   });
   transaction();
 
@@ -550,7 +651,7 @@ router.post('/merge', auth, requireRole('admin'), asyncHandler(async (req, res) 
 
 router.delete('/software/:id', auth, requireRole('admin'), asyncHandler(async (req, res) => {
   const db = getDb();
-  const { note } = req.body;
+  const note = req.body ? req.body.note : '';
   const software = db.prepare('SELECT * FROM software WHERE id = ?').get(req.params.id);
   if (!software) throw createError(404, 'Software not found');
 
@@ -561,14 +662,26 @@ router.delete('/software/:id', auth, requireRole('admin'), asyncHandler(async (r
     DELETE FROM software WHERE id = ?
   `);
   const insertAuditLog = db.prepare(`
-    INSERT INTO audit_logs (software_id, auditor_id, action, note)
-    VALUES (?, ?, 'delete', ?)
+    INSERT INTO audit_logs (software_id, auditor_id, action, note, software_name, original_software_id)
+    VALUES (?, ?, 'delete', ?, ?, ?)
   `);
 
   const transaction = db.transaction(() => {
     updateSoftware.run(req.params.id);
+
+    if (software.developer_id) {
+      insertNotification(
+        db,
+        software.developer_id,
+        'audit_deleted',
+        '软件已删除',
+        `您的软件 \"${software.name}\" 已被删除${note ? `: ${note}` : ''}`,
+        Number(req.params.id)
+      );
+    }
+
+    insertAuditLog.run(req.params.id, req.user.id, note || `Deleted software: ${software.name}`, software.name, req.params.id);
     deleteSoftware.run(req.params.id);
-    insertAuditLog.run(req.params.id, req.user.id, note || '');
   });
   transaction();
 

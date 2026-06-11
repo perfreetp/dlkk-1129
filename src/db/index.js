@@ -74,9 +74,14 @@ function initSchema() {
       price REAL DEFAULT 0,
       is_limited_free INTEGER DEFAULT 0,
       limited_free_until TEXT,
+      limited_free_from TEXT,
+      status TEXT DEFAULT 'published' CHECK(status IN ('draft','pending_review','published')),
+      reviewed_by INTEGER,
+      reviewed_at TEXT,
       released_at TEXT DEFAULT (datetime('now')),
       created_at TEXT DEFAULT (datetime('now')),
-      FOREIGN KEY (software_id) REFERENCES software(id) ON DELETE CASCADE
+      FOREIGN KEY (software_id) REFERENCES software(id) ON DELETE CASCADE,
+      FOREIGN KEY (reviewed_by) REFERENCES users(id)
     );
 
     CREATE TABLE IF NOT EXISTS screenshots (
@@ -148,7 +153,7 @@ function initSchema() {
       created_at TEXT DEFAULT (datetime('now')),
       updated_at TEXT DEFAULT (datetime('now')),
       FOREIGN KEY (user_id) REFERENCES users(id),
-      FOREIGN KEY (merged_to) REFERENCES software(id)
+      FOREIGN KEY (merged_to) REFERENCES software(id) ON DELETE SET NULL
     );
 
     CREATE TABLE IF NOT EXISTS audit_logs (
@@ -158,10 +163,14 @@ function initSchema() {
       auditor_id INTEGER NOT NULL,
       action TEXT NOT NULL CHECK(action IN ('approve','reject','delist','risk','merge','delete','resolve','dismiss')),
       note TEXT DEFAULT '',
+      software_name TEXT DEFAULT '',
+      submission_name TEXT DEFAULT '',
+      original_software_id INTEGER,
+      original_submission_id INTEGER,
       created_at TEXT DEFAULT (datetime('now')),
-      FOREIGN KEY (submission_id) REFERENCES submissions(id),
-      FOREIGN KEY (software_id) REFERENCES software(id),
-      FOREIGN KEY (auditor_id) REFERENCES users(id)
+      FOREIGN KEY (submission_id) REFERENCES submissions(id) ON DELETE SET NULL,
+      FOREIGN KEY (software_id) REFERENCES software(id) ON DELETE SET NULL,
+      FOREIGN KEY (auditor_id) REFERENCES users(id) ON DELETE SET NULL
     );
 
     CREATE TABLE IF NOT EXISTS discussion_posts (
@@ -348,6 +357,38 @@ function initSchema() {
 
   if (!columnExists('reports', 'updated_at')) {
     d.exec(`ALTER TABLE reports ADD COLUMN updated_at TEXT DEFAULT (datetime('now'))`);
+  }
+
+  if (!columnExists('versions', 'status')) {
+    d.exec(`ALTER TABLE versions ADD COLUMN status TEXT DEFAULT 'published' CHECK(status IN ('draft','pending_review','published'))`);
+  }
+
+  if (!columnExists('versions', 'limited_free_from')) {
+    d.exec(`ALTER TABLE versions ADD COLUMN limited_free_from TEXT`);
+  }
+
+  if (!columnExists('versions', 'reviewed_by')) {
+    d.exec(`ALTER TABLE versions ADD COLUMN reviewed_by INTEGER REFERENCES users(id)`);
+  }
+
+  if (!columnExists('versions', 'reviewed_at')) {
+    d.exec(`ALTER TABLE versions ADD COLUMN reviewed_at TEXT`);
+  }
+
+  if (!columnExists('audit_logs', 'software_name')) {
+    d.exec(`ALTER TABLE audit_logs ADD COLUMN software_name TEXT DEFAULT ''`);
+  }
+
+  if (!columnExists('audit_logs', 'submission_name')) {
+    d.exec(`ALTER TABLE audit_logs ADD COLUMN submission_name TEXT DEFAULT ''`);
+  }
+
+  if (!columnExists('audit_logs', 'original_software_id')) {
+    d.exec(`ALTER TABLE audit_logs ADD COLUMN original_software_id INTEGER`);
+  }
+
+  if (!columnExists('audit_logs', 'original_submission_id')) {
+    d.exec(`ALTER TABLE audit_logs ADD COLUMN original_submission_id INTEGER`);
   }
 }
 
