@@ -12,21 +12,69 @@ router.post('/:id/approve', auth, requireRole('editor', 'admin'), asyncHandler(a
   if (submission.status !== 'pending') throw createError(400, 'Submission is not pending');
 
   const insertSoftware = db.prepare(`
-    INSERT INTO software (name, description, website, status)
-    VALUES (?, ?, ?, 'approved')
+    INSERT INTO software (name, description, website, status, developer_id)
+    VALUES (?, ?, ?, 'approved', ?)
   `);
   const updateSubmission = db.prepare(`
-    UPDATE submissions SET status = 'approved', updated_at = datetime('now') WHERE id = ?
+    UPDATE submissions SET status = 'approved', updated_at = datetime('now'), merged_to = ? WHERE id = ?
   `);
   const insertAuditLog = db.prepare(`
     INSERT INTO audit_logs (submission_id, software_id, auditor_id, action, note)
     VALUES (?, ?, ?, 'approve', '')
   `);
+  const insertVersion = db.prepare(`
+    INSERT INTO versions (software_id, version_number, release_notes, compatibility)
+    VALUES (?, '1.0.0', ?, ?)
+  `);
+  const insertScreenshot = db.prepare(`
+    INSERT INTO screenshots (software_id, image_url, sort_order)
+    VALUES (?, ?, ?)
+  `);
+  const insertTag = db.prepare(`
+    INSERT OR IGNORE INTO tags (name) VALUES (?)
+  `);
+  const getTagId = db.prepare(`
+    SELECT id FROM tags WHERE name = ?
+  `);
+  const insertSoftwareTag = db.prepare(`
+    INSERT OR IGNORE INTO software_tags (software_id, tag_id)
+    VALUES (?, ?)
+  `);
 
-  const result = insertSoftware.run(submission.name, submission.description, submission.website);
-  const softwareId = result.lastInsertRowid;
-  updateSubmission.run(req.params.id);
-  insertAuditLog.run(req.params.id, softwareId, req.user.id);
+  const screenshots = JSON.parse(submission.screenshots || '[]');
+  const compatibility = JSON.parse(submission.compatibility || '[]');
+  const tags = JSON.parse(submission.tags || '[]');
+
+  const transaction = db.transaction(() => {
+    const result = insertSoftware.run(
+      submission.name,
+      submission.description,
+      submission.website,
+      submission.user_id
+    );
+    const softwareId = result.lastInsertRowid;
+
+    insertVersion.run(softwareId, submission.version_notes || '', JSON.stringify(compatibility));
+
+    screenshots.forEach((url, index) => {
+      insertScreenshot.run(softwareId, url, index);
+    });
+
+    tags.forEach((tagName) => {
+      insertTag.run(tagName);
+      const tag = getTagId.get(tagName);
+      if (tag) {
+        insertSoftwareTag.run(softwareId, tag.id);
+      }
+    });
+
+    updateSubmission.run(softwareId, req.params.id);
+    insertAuditLog.run(req.params.id, softwareId, req.user.id);
+
+    return softwareId;
+  });
+
+  const softwareId = transaction();
 
   res.json({ message: 'Submission approved', software_id: softwareId });
 }));
@@ -114,9 +162,36 @@ router.post('/merge', auth, requireRole('admin'), asyncHandler(async (req, res) 
   if (!target) throw createError(404, 'Target software not found');
 
   const transaction = db.transaction(() => {
+    const duplicateFavs = db.prepare(`
+      SELECT f.user_id FROM favorites f
+      WHERE f.software_id = ? AND f.user_id IN (
+        SELECT user_id FROM favorites WHERE software_id = ?
+      )
+    `).all(target_id, source_id);
+
+    const duplicateUserIds = duplicateFavs.map(f => f.user_id);
+    if (duplicateUserIds.length > 0) {
+      const placeholders = duplicateUserIds.map(() => '?').join(',');
+      db.prepare(`
+        DELETE FROM favorites
+        WHERE software_id = ? AND user_id IN (${placeholders})
+      `).run(source_id, ...duplicateUserIds);
+    }
+
     db.prepare('UPDATE reviews SET software_id = ? WHERE software_id = ?').run(target_id, source_id);
     db.prepare('UPDATE favorites SET software_id = ? WHERE software_id = ?').run(target_id, source_id);
     db.prepare('UPDATE download_stats SET software_id = ? WHERE software_id = ?').run(target_id, source_id);
+
+    const reviewCount = db.prepare('SELECT COUNT(*) AS c FROM reviews WHERE software_id = ?').get(target_id).c;
+    if (reviewCount > 0) {
+      const avgRow = db.prepare('SELECT AVG(rating) AS avg FROM reviews WHERE software_id = ?').get(target_id);
+      const avg = avgRow.avg !== null ? Math.round(avgRow.avg * 10) / 10 : 0;
+      db.prepare('UPDATE software SET avg_rating = ? WHERE id = ?').run(avg, target_id);
+    }
+
+    const targetDownloads = db.prepare('SELECT SUM(download_count) AS total FROM software WHERE id IN (?, ?)').get(source_id, target_id).total || 0;
+    db.prepare('UPDATE software SET download_count = ? WHERE id = ?').run(targetDownloads, target_id);
+
     db.prepare('DELETE FROM software WHERE id = ?').run(source_id);
     db.prepare(`
       INSERT INTO audit_logs (software_id, auditor_id, action, note)

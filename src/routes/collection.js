@@ -19,8 +19,9 @@ router.get(
     const params = [];
 
     if (is_official !== undefined) {
+      const officialVal = is_official === 'true' || is_official === true || is_official === 1 ? 1 : 0;
       conditions.push('c.is_official = ?');
-      params.push(is_official ? 1 : 0);
+      params.push(officialVal);
     }
 
     const where = conditions.length ? 'WHERE ' + conditions.join(' AND ') : '';

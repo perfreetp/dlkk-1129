@@ -5,6 +5,53 @@ const { asyncHandler, createError } = require('../middleware/errorHandler');
 
 const router = express.Router();
 
+function getBlockedUserIds(db, userId) {
+  if (!userId) return { blockerIds: [], blockedIds: [] };
+  const blockedIds = db.prepare(
+    'SELECT blocked_id FROM blocked_users WHERE blocker_id = ?'
+  ).all(userId).map(r => r.blocked_id);
+  const blockerIds = db.prepare(
+    'SELECT blocker_id FROM blocked_users WHERE blocked_id = ?'
+  ).all(userId).map(r => r.blocker_id);
+  return { blockerIds, blockedIds };
+}
+
+function addBlockedFilter(conditions, params, userId, db, column = 'p.user_id') {
+  if (!userId) return;
+  const { blockerIds, blockedIds } = getBlockedUserIds(db, userId);
+  const allExcluded = [...new Set([...blockerIds, ...blockedIds])];
+  if (allExcluded.length > 0) {
+    const placeholders = allExcluded.map(() => '?').join(',');
+    conditions.push(`${column} NOT IN (${placeholders})`);
+    params.push(...allExcluded);
+  }
+}
+
+function getOptionalUserId(req) {
+  const authHeader = req.headers.authorization;
+  if (!authHeader || !authHeader.startsWith('Bearer ')) return null;
+  const token = authHeader.slice(7);
+  try {
+    const jwt = require('jsonwebtoken');
+    const decoded = jwt.verify(token, process.env.JWT_SECRET || 'macos_community_secret');
+    return decoded.id;
+  } catch (e) {
+    return null;
+  }
+}
+
+function checkBlockedRelation(db, userId1, userId2, action) {
+  if (!userId1 || !userId2 || userId1 === userId2) return;
+  const blocked = db.prepare(
+    `SELECT id FROM blocked_users 
+     WHERE (blocker_id = ? AND blocked_id = ?) 
+        OR (blocker_id = ? AND blocked_id = ?)`
+  ).get(userId1, userId2, userId2, userId1);
+  if (blocked) {
+    throw createError(403, `Cannot ${action}: blocked relationship exists`);
+  }
+}
+
 router.post('/posts', auth, asyncHandler(async (req, res) => {
   const { software_id, title, content } = req.body;
   if (!title || !content) {
@@ -33,6 +80,9 @@ router.get('/posts', asyncHandler(async (req, res) => {
     conditions.push('p.software_id = ?');
     params.push(Number(software_id));
   }
+
+  const userId = getOptionalUserId(req);
+  addBlockedFilter(conditions, params, userId, db, 'p.user_id');
 
   const where = conditions.length ? 'WHERE ' + conditions.join(' AND ') : '';
 
@@ -65,6 +115,13 @@ router.get('/posts/:id', asyncHandler(async (req, res) => {
   ).get(req.params.id);
 
   if (!post) throw createError(404, 'Post not found');
+
+  const userId = getOptionalUserId(req);
+  const { blockerIds, blockedIds } = getBlockedUserIds(db, userId);
+  if (blockerIds.includes(post.user_id) || blockedIds.includes(post.user_id)) {
+    throw createError(404, 'Post not found');
+  }
+
   res.json(post);
 }));
 
@@ -107,6 +164,8 @@ router.post('/posts/:id/replies', auth, asyncHandler(async (req, res) => {
   const post = db.prepare('SELECT * FROM discussion_posts WHERE id = ?').get(req.params.id);
   if (!post) throw createError(404, 'Post not found');
 
+  checkBlockedRelation(db, req.user.id, post.user_id, 'reply to this post');
+
   const result = db.prepare(
     'INSERT INTO discussion_replies (post_id, user_id, content) VALUES (?, ?, ?)'
   ).run(req.params.id, req.user.id, content);
@@ -116,15 +175,18 @@ router.post('/posts/:id/replies', auth, asyncHandler(async (req, res) => {
   ).run(req.params.id);
 
   if (post.user_id !== req.user.id) {
-    db.prepare(
-      'INSERT INTO notifications (user_id, type, title, content, related_id) VALUES (?, ?, ?, ?, ?)'
-    ).run(
-      post.user_id,
-      'reply',
-      'New reply to your post',
-      `${req.user.username} replied to your post "${post.title}"`,
-      Number(req.params.id)
-    );
+    const { blockedIds } = getBlockedUserIds(db, post.user_id);
+    if (!blockedIds.includes(req.user.id)) {
+      db.prepare(
+        'INSERT INTO notifications (user_id, type, title, content, related_id) VALUES (?, ?, ?, ?, ?)'
+      ).run(
+        post.user_id,
+        'reply',
+        'New reply to your post',
+        `${req.user.username} replied to your post "${post.title}"`,
+        Number(req.params.id)
+      );
+    }
   }
 
   res.status(201).json({ id: result.lastInsertRowid });
@@ -140,19 +202,27 @@ router.get('/posts/:id/replies', asyncHandler(async (req, res) => {
   const post = db.prepare('SELECT id FROM discussion_posts WHERE id = ?').get(req.params.id);
   if (!post) throw createError(404, 'Post not found');
 
+  const conditions = ['r.post_id = ?'];
+  const params = [req.params.id];
+
+  const userId = getOptionalUserId(req);
+  addBlockedFilter(conditions, params, userId, db, 'r.user_id');
+
+  const where = 'WHERE ' + conditions.join(' AND ');
+
   const totalRow = db.prepare(
-    'SELECT COUNT(*) AS total FROM discussion_replies WHERE post_id = ?'
-  ).get(req.params.id);
+    `SELECT COUNT(*) AS total FROM discussion_replies r ${where}`
+  ).get(...params);
   const total = totalRow.total;
 
   const items = db.prepare(
     `SELECT r.*, u.username, u.avatar, r.like_count
      FROM discussion_replies r
      JOIN users u ON u.id = r.user_id
-     WHERE r.post_id = ?
+     ${where}
      ORDER BY r.created_at ASC
      LIMIT ? OFFSET ?`
-  ).all(req.params.id, limit, offset);
+  ).all(...params, limit, offset);
 
   res.json({ items, total, page, limit });
 }));
@@ -162,6 +232,8 @@ router.post('/posts/:id/like', auth, asyncHandler(async (req, res) => {
 
   const post = db.prepare('SELECT * FROM discussion_posts WHERE id = ?').get(req.params.id);
   if (!post) throw createError(404, 'Post not found');
+
+  checkBlockedRelation(db, req.user.id, post.user_id, 'like this post');
 
   const existing = db.prepare(
     'SELECT * FROM post_likes WHERE post_id = ? AND user_id = ?'
@@ -183,6 +255,8 @@ router.post('/replies/:id/like', auth, asyncHandler(async (req, res) => {
 
   const reply = db.prepare('SELECT * FROM discussion_replies WHERE id = ?').get(req.params.id);
   if (!reply) throw createError(404, 'Reply not found');
+
+  checkBlockedRelation(db, req.user.id, reply.user_id, 'like this reply');
 
   const existing = db.prepare(
     'SELECT * FROM reply_likes WHERE reply_id = ? AND user_id = ?'
@@ -210,12 +284,32 @@ router.post('/report', auth, asyncHandler(async (req, res) => {
 
   const db = getDb();
 
+  let targetUserId = null;
+
+  if (target_type === 'post') {
+    const post = db.prepare('SELECT user_id FROM discussion_posts WHERE id = ?').get(target_id);
+    if (!post) throw createError(404, 'Post not found');
+    targetUserId = post.user_id;
+  } else if (target_type === 'reply') {
+    const reply = db.prepare('SELECT user_id FROM discussion_replies WHERE id = ?').get(target_id);
+    if (!reply) throw createError(404, 'Reply not found');
+    targetUserId = reply.user_id;
+  } else if (target_type === 'user') {
+    const user = db.prepare('SELECT id FROM users WHERE id = ?').get(target_id);
+    if (!user) throw createError(404, 'User not found');
+    targetUserId = target_id;
+  }
+
+  if (targetUserId) {
+    checkBlockedRelation(db, req.user.id, targetUserId, 'report this content');
+  }
+
   const blocked = db.prepare(
     'SELECT id FROM blocked_users WHERE blocker_id = ? AND blocked_id = ?'
-  ).get(req.user.id, target_id);
+  ).get(req.user.id, targetUserId);
 
-  if (target_type === 'user' && blocked) {
-    throw createError(403, 'Cannot report a blocked user or user who blocked you');
+  if (blocked) {
+    throw createError(403, 'Cannot report a blocked user');
   }
 
   const result = db.prepare(
