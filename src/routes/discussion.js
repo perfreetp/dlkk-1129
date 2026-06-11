@@ -52,6 +52,12 @@ function checkBlockedRelation(db, userId1, userId2, action) {
   }
 }
 
+function insertNotification(db, user_id, type, title, content, related_id) {
+  db.prepare(
+    'INSERT INTO notifications (user_id, type, title, content, related_id) VALUES (?, ?, ?, ?, ?)'
+  ).run(user_id, type, title, content, related_id);
+}
+
 router.post('/posts', auth, asyncHandler(async (req, res) => {
   const { software_id, title, content } = req.body;
   if (!title || !content) {
@@ -75,6 +81,8 @@ router.get('/posts', asyncHandler(async (req, res) => {
 
   const conditions = [];
   const params = [];
+
+  conditions.push('p.is_hidden = 0');
 
   if (software_id) {
     conditions.push('p.software_id = ?');
@@ -111,7 +119,7 @@ router.get('/posts/:id', asyncHandler(async (req, res) => {
        p.like_count, p.reply_count
      FROM discussion_posts p
      JOIN users u ON u.id = p.user_id
-     WHERE p.id = ?`
+     WHERE p.id = ? AND p.is_hidden = 0`
   ).get(req.params.id);
 
   if (!post) throw createError(404, 'Post not found');
@@ -177,9 +185,8 @@ router.post('/posts/:id/replies', auth, asyncHandler(async (req, res) => {
   if (post.user_id !== req.user.id) {
     const { blockedIds } = getBlockedUserIds(db, post.user_id);
     if (!blockedIds.includes(req.user.id)) {
-      db.prepare(
-        'INSERT INTO notifications (user_id, type, title, content, related_id) VALUES (?, ?, ?, ?, ?)'
-      ).run(
+      insertNotification(
+        db,
         post.user_id,
         'reply',
         'New reply to your post',
@@ -202,7 +209,7 @@ router.get('/posts/:id/replies', asyncHandler(async (req, res) => {
   const post = db.prepare('SELECT id FROM discussion_posts WHERE id = ?').get(req.params.id);
   if (!post) throw createError(404, 'Post not found');
 
-  const conditions = ['r.post_id = ?'];
+  const conditions = ['r.post_id = ?', 'r.is_hidden = 0'];
   const params = [req.params.id];
 
   const userId = getOptionalUserId(req);
@@ -246,6 +253,21 @@ router.post('/posts/:id/like', auth, asyncHandler(async (req, res) => {
   } else {
     db.prepare('INSERT INTO post_likes (post_id, user_id) VALUES (?, ?)').run(req.params.id, req.user.id);
     db.prepare('UPDATE discussion_posts SET like_count = like_count + 1 WHERE id = ?').run(req.params.id);
+
+    if (post.user_id !== req.user.id) {
+      const { blockedIds } = getBlockedUserIds(db, post.user_id);
+      if (!blockedIds.includes(req.user.id)) {
+        insertNotification(
+          db,
+          post.user_id,
+          'like',
+          'New like on your post',
+          `${req.user.username} liked your post "${post.title}"`,
+          Number(req.params.id)
+        );
+      }
+    }
+
     res.json({ liked: true });
   }
 }));
@@ -269,6 +291,22 @@ router.post('/replies/:id/like', auth, asyncHandler(async (req, res) => {
   } else {
     db.prepare('INSERT INTO reply_likes (reply_id, user_id) VALUES (?, ?)').run(req.params.id, req.user.id);
     db.prepare('UPDATE discussion_replies SET like_count = like_count + 1 WHERE id = ?').run(req.params.id);
+
+    if (reply.user_id !== req.user.id) {
+      const { blockedIds } = getBlockedUserIds(db, reply.user_id);
+      if (!blockedIds.includes(req.user.id)) {
+        const post = db.prepare('SELECT title FROM discussion_posts WHERE id = ?').get(reply.post_id);
+        insertNotification(
+          db,
+          reply.user_id,
+          'like',
+          'New like on your reply',
+          `${req.user.username} liked your reply on "${post ? post.title : 'a post'}"`,
+          Number(reply.post_id)
+        );
+      }
+    }
+
     res.json({ liked: true });
   }
 }));
@@ -346,7 +384,7 @@ router.delete('/block/:blocked_id', auth, asyncHandler(async (req, res) => {
 
 router.get('/notifications', auth, asyncHandler(async (req, res) => {
   const db = getDb();
-  const { is_read, page: pageStr = '1', limit: limitStr = '20' } = req.query;
+  const { is_read, type, page: pageStr = '1', limit: limitStr = '20' } = req.query;
   const page = Math.max(1, parseInt(pageStr, 10) || 1);
   const limit = Math.max(1, parseInt(limitStr, 10) || 20);
   const offset = (page - 1) * limit;
@@ -357,6 +395,11 @@ router.get('/notifications', auth, asyncHandler(async (req, res) => {
   if (is_read !== undefined) {
     conditions.push('is_read = ?');
     params.push(Number(is_read));
+  }
+
+  if (type !== undefined) {
+    conditions.push('type = ?');
+    params.push(type);
   }
 
   const where = 'WHERE ' + conditions.join(' AND ');
@@ -389,6 +432,32 @@ router.put('/notifications/read-all', auth, asyncHandler(async (req, res) => {
   const db = getDb();
   db.prepare('UPDATE notifications SET is_read = 1 WHERE user_id = ?').run(req.user.id);
   res.json({ message: 'All notifications marked as read' });
+}));
+
+router.delete('/notifications/clear', auth, asyncHandler(async (req, res) => {
+  const db = getDb();
+  const { type } = req.query;
+
+  if (type !== undefined) {
+    db.prepare(
+      'DELETE FROM notifications WHERE user_id = ? AND type = ?'
+    ).run(req.user.id, type);
+  } else {
+    db.prepare(
+      'DELETE FROM notifications WHERE user_id = ?'
+    ).run(req.user.id);
+  }
+
+  res.json({ message: 'Notifications cleared' });
+}));
+
+router.get('/notifications/unread-count', auth, asyncHandler(async (req, res) => {
+  const db = getDb();
+  const result = db.prepare(
+    'SELECT COUNT(*) AS count FROM notifications WHERE user_id = ? AND is_read = 0'
+  ).get(req.user.id);
+
+  res.json({ count: result.count });
 }));
 
 module.exports = router;

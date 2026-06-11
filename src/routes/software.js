@@ -1,6 +1,7 @@
 const express = require('express');
 const getDb = require('../db/index').getDb;
 const { asyncHandler, createError } = require('../middleware/errorHandler');
+const { auth, requireRole } = require('../middleware/auth');
 
 const router = express.Router();
 
@@ -72,15 +73,31 @@ router.get('/:id', asyncHandler((req, res) => {
     `SELECT * FROM versions WHERE software_id = ? ORDER BY released_at DESC LIMIT 3`
   ).all(req.params.id);
 
-  res.json({ ...software, tags, screenshots, versions });
+  const latest_version = db.prepare(
+    `SELECT * FROM versions WHERE software_id = ? ORDER BY released_at DESC LIMIT 1`
+  ).get(req.params.id);
+
+  res.json({ ...software, tags, screenshots, versions, latest_version });
 }));
 
 router.get('/:id/versions', asyncHandler((req, res) => {
   const db = getDb();
+  const { page: pageStr = '1', limit: limitStr = '20' } = req.query;
+
+  const page = Math.max(1, parseInt(pageStr, 10) || 1);
+  const limit = Math.max(1, parseInt(limitStr, 10) || 20);
+  const offset = (page - 1) * limit;
+
+  const countRow = db.prepare(
+    `SELECT COUNT(*) AS total FROM versions WHERE software_id = ?`
+  ).get(req.params.id);
+  const total = countRow.total;
+
   const versions = db.prepare(
-    `SELECT * FROM versions WHERE software_id = ? ORDER BY released_at DESC`
-  ).all(req.params.id);
-  res.json(versions);
+    `SELECT * FROM versions WHERE software_id = ? ORDER BY released_at DESC LIMIT ? OFFSET ?`
+  ).all(req.params.id, limit, offset);
+
+  res.json({ items: versions, total, page, limit });
 }));
 
 router.get('/:id/versions/:versionId', asyncHandler((req, res) => {
@@ -91,6 +108,125 @@ router.get('/:id/versions/:versionId', asyncHandler((req, res) => {
 
   if (!version) throw createError(404, 'Version not found');
   res.json(version);
+}));
+
+router.post('/:id/versions', auth, asyncHandler((req, res) => {
+  const db = getDb();
+  const software = db.prepare(
+    `SELECT * FROM software WHERE id = ?`
+  ).get(req.params.id);
+
+  if (!software) throw createError(404, 'Software not found');
+
+  const isDeveloper = req.user.id === software.developer_id;
+  const isAdminOrEditor = ['admin', 'editor'].includes(req.user.role);
+  if (!isDeveloper && !isAdminOrEditor) {
+    throw createError(403, 'Forbidden');
+  }
+
+  const { version_number, release_notes, compatibility, download_url, file_size, is_free, price, is_limited_free, limited_free_until } = req.body;
+
+  if (!version_number) throw createError(400, 'version_number is required');
+
+  const result = db.prepare(
+    `INSERT INTO versions (software_id, version_number, release_notes, compatibility, download_url, file_size, is_free, price, is_limited_free, limited_free_until)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+  ).run(
+    req.params.id,
+    version_number,
+    release_notes || '',
+    compatibility || '[]',
+    download_url || '',
+    file_size || 0,
+    is_free !== undefined ? is_free : 1,
+    price || 0,
+    is_limited_free || 0,
+    limited_free_until || null
+  );
+
+  const version = db.prepare(
+    `SELECT * FROM versions WHERE id = ?`
+  ).get(result.lastInsertRowid);
+
+  res.status(201).json(version);
+}));
+
+router.put('/:id/versions/:versionId', auth, asyncHandler((req, res) => {
+  const db = getDb();
+  const software = db.prepare(
+    `SELECT * FROM software WHERE id = ?`
+  ).get(req.params.id);
+
+  if (!software) throw createError(404, 'Software not found');
+
+  const version = db.prepare(
+    `SELECT * FROM versions WHERE id = ? AND software_id = ?`
+  ).get(req.params.versionId, req.params.id);
+
+  if (!version) throw createError(404, 'Version not found');
+
+  const isDeveloper = req.user.id === software.developer_id;
+  const isAdmin = req.user.role === 'admin';
+  if (!isDeveloper && !isAdmin) {
+    throw createError(403, 'Forbidden');
+  }
+
+  const { version_number, release_notes, compatibility, download_url, file_size, is_free, price, is_limited_free, limited_free_until, released_at } = req.body;
+
+  db.prepare(
+    `UPDATE versions SET
+       version_number = COALESCE(?, version_number),
+       release_notes = COALESCE(?, release_notes),
+       compatibility = COALESCE(?, compatibility),
+       download_url = COALESCE(?, download_url),
+       file_size = COALESCE(?, file_size),
+       is_free = COALESCE(?, is_free),
+       price = COALESCE(?, price),
+       is_limited_free = COALESCE(?, is_limited_free),
+       limited_free_until = COALESCE(?, limited_free_until),
+       released_at = COALESCE(?, released_at)
+     WHERE id = ? AND software_id = ?`
+  ).run(
+    version_number,
+    release_notes,
+    compatibility,
+    download_url,
+    file_size,
+    is_free,
+    price,
+    is_limited_free,
+    limited_free_until,
+    released_at,
+    req.params.versionId,
+    req.params.id
+  );
+
+  const updatedVersion = db.prepare(
+    `SELECT * FROM versions WHERE id = ? AND software_id = ?`
+  ).get(req.params.versionId, req.params.id);
+
+  res.json(updatedVersion);
+}));
+
+router.delete('/:id/versions/:versionId', auth, requireRole('admin'), asyncHandler((req, res) => {
+  const db = getDb();
+  const software = db.prepare(
+    `SELECT * FROM software WHERE id = ?`
+  ).get(req.params.id);
+
+  if (!software) throw createError(404, 'Software not found');
+
+  const version = db.prepare(
+    `SELECT * FROM versions WHERE id = ? AND software_id = ?`
+  ).get(req.params.versionId, req.params.id);
+
+  if (!version) throw createError(404, 'Version not found');
+
+  db.prepare(
+    `DELETE FROM versions WHERE id = ? AND software_id = ?`
+  ).run(req.params.versionId, req.params.id);
+
+  res.json({ message: 'Version deleted successfully' });
 }));
 
 module.exports = router;

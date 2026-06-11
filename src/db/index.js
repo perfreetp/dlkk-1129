@@ -156,7 +156,7 @@ function initSchema() {
       submission_id INTEGER,
       software_id INTEGER,
       auditor_id INTEGER NOT NULL,
-      action TEXT NOT NULL CHECK(action IN ('approve','reject','delist','risk','merge')),
+      action TEXT NOT NULL CHECK(action IN ('approve','reject','delist','risk','merge','delete','resolve','dismiss')),
       note TEXT DEFAULT '',
       created_at TEXT DEFAULT (datetime('now')),
       FOREIGN KEY (submission_id) REFERENCES submissions(id),
@@ -172,6 +172,7 @@ function initSchema() {
       content TEXT DEFAULT '',
       like_count INTEGER DEFAULT 0,
       reply_count INTEGER DEFAULT 0,
+      is_hidden INTEGER DEFAULT 0,
       created_at TEXT DEFAULT (datetime('now')),
       updated_at TEXT DEFAULT (datetime('now')),
       FOREIGN KEY (software_id) REFERENCES software(id) ON DELETE SET NULL,
@@ -184,6 +185,7 @@ function initSchema() {
       user_id INTEGER NOT NULL,
       content TEXT NOT NULL,
       like_count INTEGER DEFAULT 0,
+      is_hidden INTEGER DEFAULT 0,
       created_at TEXT DEFAULT (datetime('now')),
       updated_at TEXT DEFAULT (datetime('now')),
       FOREIGN KEY (post_id) REFERENCES discussion_posts(id) ON DELETE CASCADE,
@@ -217,7 +219,9 @@ function initSchema() {
       target_id INTEGER NOT NULL,
       reason TEXT DEFAULT '',
       status TEXT DEFAULT 'pending' CHECK(status IN ('pending','resolved','dismissed')),
+      resolution_note TEXT DEFAULT '',
       created_at TEXT DEFAULT (datetime('now')),
+      updated_at TEXT DEFAULT (datetime('now')),
       FOREIGN KEY (reporter_id) REFERENCES users(id)
     );
 
@@ -323,6 +327,27 @@ function initSchema() {
       for (const item of items) insertCat.run(...item);
     });
     insertMany(cats);
+  }
+
+  function columnExists(tableName, columnName) {
+    const cols = d.prepare(`PRAGMA table_info(${tableName})`).all();
+    return cols.some(c => c.name === columnName);
+  }
+
+  if (!columnExists('discussion_posts', 'is_hidden')) {
+    d.exec(`ALTER TABLE discussion_posts ADD COLUMN is_hidden INTEGER DEFAULT 0`);
+  }
+
+  if (!columnExists('discussion_replies', 'is_hidden')) {
+    d.exec(`ALTER TABLE discussion_replies ADD COLUMN is_hidden INTEGER DEFAULT 0`);
+  }
+
+  if (!columnExists('reports', 'resolution_note')) {
+    d.exec(`ALTER TABLE reports ADD COLUMN resolution_note TEXT DEFAULT ''`);
+  }
+
+  if (!columnExists('reports', 'updated_at')) {
+    d.exec(`ALTER TABLE reports ADD COLUMN updated_at TEXT DEFAULT (datetime('now'))`);
   }
 }
 
