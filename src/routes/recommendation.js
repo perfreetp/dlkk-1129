@@ -64,16 +64,21 @@ router.get('/limited-free', asyncHandler((req, res) => {
   const db = getDb();
 
   const items = db.prepare(
-    `SELECT s.*, v.price AS original_price, v.is_limited_free, v.limited_free_until, v.version_number
+    `SELECT s.*, v.price AS original_price, v.is_limited_free, v.limited_free_until, v.limited_free_from, v.version_number
      FROM software s
      JOIN versions v ON v.software_id = s.id
      WHERE s.status = 'approved'
+       AND v.status = 'published'
        AND v.is_limited_free = 1
+       AND v.limited_free_from IS NOT NULL
+       AND v.limited_free_from <= datetime('now')
+       AND v.limited_free_until IS NOT NULL
        AND v.limited_free_until > datetime('now')
        AND v.id = (
          SELECT v2.id FROM versions v2
          WHERE v2.software_id = s.id
-         ORDER BY v2.released_at DESC
+           AND v2.status = 'published'
+         ORDER BY v2.released_at DESC, v2.id DESC
          LIMIT 1
        )
      ORDER BY v.limited_free_until ASC`

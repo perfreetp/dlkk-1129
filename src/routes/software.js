@@ -11,16 +11,21 @@ function insertNotification(db, user_id, type, title, content, related_id) {
   ).run(user_id, type, title, content, related_id);
 }
 
+function normalizeTime(t) {
+  if (!t) return null;
+  return String(t).replace('T', ' ').replace('Z', '').split('.')[0];
+}
+
 function addIsCurrentlyFree(version) {
   if (!version) return version;
   const now = new Date().toISOString().replace('T', ' ').replace('Z', '').split('.')[0];
   let is_currently_free = version.is_free;
-  if (version.is_limited_free === 1) {
-    const fromOk = version.limited_free_from && version.limited_free_from <= now;
-    const untilOk = !version.limited_free_until || version.limited_free_until > now;
-    if (fromOk && untilOk) {
-      is_currently_free = 1;
-    }
+  if (version.is_limited_free === 1 || version.is_limited_free === true || version.is_limited_free === '1') {
+    const fromStr = normalizeTime(version.limited_free_from);
+    const untilStr = normalizeTime(version.limited_free_until);
+    const fromOk = !fromStr || fromStr <= now;
+    const untilOk = !untilStr || untilStr > now;
+    is_currently_free = (fromOk && untilOk) ? 1 : 0;
   }
   return { ...version, is_currently_free };
 }
@@ -205,7 +210,13 @@ router.post('/:id/versions', auth, asyncHandler((req, res) => {
 
   if (!version_number) throw createError(400, 'version_number is required');
 
-  const versionStatus = status === 'published' ? 'published' : 'draft';
+  const existing = db.prepare(
+    `SELECT id FROM versions WHERE software_id = ? AND version_number = ?`
+  ).get(req.params.id, version_number);
+  if (existing) throw createError(400, `Version ${version_number} already exists`);
+
+  const canPublish = ['admin', 'editor'].includes(req.user.role);
+  const versionStatus = canPublish && status === 'published' ? 'published' : (canPublish ? (status || 'draft') : 'draft');
 
   const result = db.prepare(
     `INSERT INTO versions (software_id, version_number, release_notes, compatibility, download_url, file_size, is_free, price, is_limited_free, limited_free_until, limited_free_from, status)
@@ -255,8 +266,21 @@ router.put('/:id/versions/:versionId', auth, asyncHandler((req, res) => {
   const {
     version_number, release_notes, compatibility, download_url, file_size,
     is_free, price, is_limited_free, limited_free_until, limited_free_from,
-    released_at, status
+    released_at
   } = req.body;
+
+  let newStatus = version.status;
+  if (req.body.status) {
+    if (['admin', 'editor'].includes(req.user.role)) {
+      newStatus = req.body.status;
+    } else if (version.status === 'published' && req.body.status === 'draft') {
+      throw createError(400, 'Published versions cannot be reverted to draft by developer');
+    } else if (req.body.status === 'published') {
+      throw createError(400, 'Cannot set status to published directly, use submit+approve workflow instead');
+    } else if (req.body.status === 'pending_review') {
+      throw createError(400, 'Use /submit endpoint to submit version for review');
+    }
+  }
 
   db.prepare(
     `UPDATE versions SET
@@ -271,7 +295,7 @@ router.put('/:id/versions/:versionId', auth, asyncHandler((req, res) => {
        limited_free_until = COALESCE(?, limited_free_until),
        limited_free_from = COALESCE(?, limited_free_from),
        released_at = COALESCE(?, released_at),
-       status = COALESCE(?, status)
+       status = ?
      WHERE id = ? AND software_id = ?`
   ).run(
     version_number,
@@ -285,7 +309,7 @@ router.put('/:id/versions/:versionId', auth, asyncHandler((req, res) => {
     limited_free_until,
     limited_free_from,
     released_at,
-    status,
+    newStatus,
     req.params.versionId,
     req.params.id
   );
@@ -317,13 +341,28 @@ router.post('/:id/versions/:versionId/submit', auth, asyncHandler((req, res) => 
 
   if (!version) throw createError(404, 'Version not found');
 
+  if (version.status === 'published') {
+    throw createError(400, 'Version is already published, cannot submit for review');
+  }
+  if (version.status === 'pending_review') {
+    throw createError(400, 'Version is already pending review, please wait for auditor decision');
+  }
   if (version.status !== 'draft') {
-    throw createError(400, 'Only draft versions can be submitted for review');
+    throw createError(400, `Only draft versions can be submitted (current: ${version.status})`);
   }
 
   db.prepare(
     `UPDATE versions SET status = 'pending_review' WHERE id = ?`
   ).run(req.params.versionId);
+
+  insertNotification(
+    db,
+    req.user.id,
+    'version_submitted',
+    '版本已提交审核',
+    `版本 "${version.version_number}" 已提交审核,等待管理员处理`,
+    Number(req.params.id)
+  );
 
   const updatedVersion = db.prepare(
     `SELECT * FROM versions WHERE id = ?`
@@ -341,8 +380,14 @@ router.put('/:id/versions/:versionId/approve', auth, requireRole('admin', 'edito
 
   if (!version) throw createError(404, 'Version not found');
 
+  if (version.status === 'published') {
+    throw createError(400, 'Version is already published, no need to approve again');
+  }
+  if (version.status === 'draft') {
+    throw createError(400, 'Draft versions must be submitted for review before approval');
+  }
   if (version.status !== 'pending_review') {
-    throw createError(400, 'Only pending_review versions can be approved');
+    throw createError(400, `Only pending_review versions can be approved (current: ${version.status})`);
   }
 
   db.prepare(
@@ -378,8 +423,14 @@ router.put('/:id/versions/:versionId/reject', auth, requireRole('admin', 'editor
 
   if (!version) throw createError(404, 'Version not found');
 
+  if (version.status === 'published') {
+    throw createError(400, 'Published versions cannot be rejected, use delist endpoint instead');
+  }
+  if (version.status === 'draft') {
+    throw createError(400, 'Draft versions are not under review, no need to reject');
+  }
   if (version.status !== 'pending_review') {
-    throw createError(400, 'Only pending_review versions can be rejected');
+    throw createError(400, `Only pending_review versions can be rejected (current: ${version.status})`);
   }
 
   db.prepare(

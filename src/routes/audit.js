@@ -642,7 +642,7 @@ router.post('/merge', auth, requireRole('admin'), asyncHandler(async (req, res) 
     db.prepare(`
       INSERT INTO audit_logs (software_id, auditor_id, action, note, software_name, original_software_id)
       VALUES (?, ?, 'merge', ?, ?, ?)
-    `).run(target_id, req.user.id, `Merged software ${source_id} into ${target_id}`, targetSoftware.name, target_id);
+    `).run(target_id, req.user.id, `Merged software ${source_id} into ${target_id}`, target.name, target_id);
   });
   transaction();
 
